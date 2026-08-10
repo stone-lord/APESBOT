@@ -129,6 +129,12 @@ SERVER_LABELS = {
     "AAS": "МИКС",
     "Spec Ops": "SPEC OPS",
     "Custom": "CUSTOM",
+    # Если одновременно активно несколько физических Custom-серверов (ID 9/10/11
+    # из SQSTAT_SERVER_MAP) — они не сливаются в одну карточку, а получают
+    # отдельные подписи с суффиксом raw ID. Регистрируем заранее все возможные.
+    "Custom 9": "CUSTOM 9",
+    "Custom 10": "CUSTOM 10",
+    "Custom 11": "CUSTOM 11",
     PSTN_LABEL: PSTN_LABEL.upper(),
     f"{PSTN_LABEL} 1": f"{PSTN_LABEL.upper()} 1",
     f"{PSTN_LABEL} 2": f"{PSTN_LABEL.upper()} 2",
@@ -514,22 +520,39 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
         except Exception as e:
             log.warning(f"{base_url} public.php error: {e}")
 
-        # 3. Парсинг текущего онлайна
-        active_servers = [sid for sid, sdata in clan_data.get("servers", {}).items() if sdata and not isinstance(sdata, list)]
-        multiple_servers = len(active_servers) > 1
+        # 3. Парсинг текущего онлайна.
+        # ВАЖНО: несколько разных физических серверов (raw srv_id) могут вести в один
+        # и тот же ярлык (например SQSTAT_SERVER_MAP мапит ID 9/10/11 все в "Custom").
+        # Если такие сервера ОДНОВРЕМЕННО активны — их нельзя молча сливать в одну
+        # карточку: список игроков смешается, а бейдж карты/онлайна возьмёт данные
+        # только от первого попавшего туда игрока, показывая неверную цифру для
+        # остальных. Поэтому: считаем базовое имя для каждого активного srv_id,
+        # и если имя встречается больше одного раза среди активных — различаем
+        # суффиксом srv_id (та же логика, что уже была только для PSTN).
+        active_ids = [sid for sid, sdata in clan_data.get("servers", {}).items() if sdata and not isinstance(sdata, list)]
+
+        def _base_name(sid: str) -> str:
+            return default_srv_prefix if default_srv_prefix else SQSTAT_SERVER_MAP.get(str(sid), "Custom")
+
+        base_name_counts: dict[str, int] = {}
+        for sid in active_ids:
+            bn = _base_name(sid)
+            base_name_counts[bn] = base_name_counts.get(bn, 0) + 1
+
+        if active_ids:
+            dupes = {bn: c for bn, c in base_name_counts.items() if c > 1}
+            log.info(
+                f"{base_url}: активные srv_id={active_ids}, "
+                f"инфо от public.php по ним={ {sid: server_info.get(str(sid)) for sid in active_ids} }"
+                + (f", РАЗДЕЛЯЮ дубли: {dupes}" if dupes else "")
+            )
 
         for srv_id, srv_data in clan_data.get("servers", {}).items():
             if not srv_data or isinstance(srv_data, list):
                 continue
 
-            # Если парсим PSTN: разделяем на PSTN 1, PSTN 2 (если их несколько)
-            if default_srv_prefix:
-                if multiple_servers:
-                    srv_name = f"{default_srv_prefix} {srv_id}"
-                else:
-                    srv_name = default_srv_prefix
-            else:
-                srv_name = SQSTAT_SERVER_MAP.get(str(srv_id), "Custom")
+            base_name = _base_name(srv_id)
+            srv_name = f"{base_name} {srv_id}" if base_name_counts.get(base_name, 0) > 1 else base_name
 
             info = server_info.get(str(srv_id), {})
             cur_map = info.get("map", "")
