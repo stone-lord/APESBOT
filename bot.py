@@ -777,7 +777,7 @@ async def cmd_tg_send(ctx: commands.Context, *, text: str):
     is_allowed_user = ctx.author.id == ALLOWED_USER_ID
 
     if not (has_role or is_allowed_user):
-        await ctx.send("❌ У вас нет прав для использования этой команды. иди нахуй")
+        await ctx.send("❌ У вас нет прав для использования этой команды.")
         return
 
     if not tg_bot or not TELEGRAM_CHAT_ID:
