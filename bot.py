@@ -765,9 +765,21 @@ async def cmd_roster(ctx: commands.Context):
         await ctx.send(text)
 
 
+ALLOWED_ROLE_ID = 1402345523335135344
+ALLOWED_USER_ID = 1222498661913854014
+
+
 @bot.command(name="tgsend")
 async def cmd_tg_send(ctx: commands.Context, *, text: str):
     """Отправляет произвольное сообщение в подключённый Telegram-чат."""
+    # Проверка прав: пользователь по ID или наличие нужной роли
+    has_role = any(role.id == ALLOWED_ROLE_ID for role in getattr(ctx.author, "roles", []))
+    is_allowed_user = ctx.author.id == ALLOWED_USER_ID
+
+    if not (has_role or is_allowed_user):
+        await ctx.send("❌ У вас нет прав для использования этой команды.")
+        return
+
     if not tg_bot or not TELEGRAM_CHAT_ID:
         await ctx.send("Интеграция с Telegram не настроена на сервере (проверь .env).")
         return
