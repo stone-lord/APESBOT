@@ -1,10 +1,6 @@
 """
-NW Discord Bot — модуль мониторинга онлайна (sqstat + pstn.sqstat.ru).
-Каждые POLL_INTERVAL_SECONDS секунд запрашивает данные с обоих сайтов sqstat
-и публикует/обновляет PNG-карточку с текущим онлайном в указанном канале.
-
-Требования: discord.py, aiohttp, Pillow (см. requirements.txt)
-Все настройки — через переменные окружения (см. .env.example).
+NW Discord Bot — модуль мониторинга онлайна (sqstat + pstn.sqstat.ru)
+и кросспостинга объявлений/команд в Telegram-группу.
 """
 
 import asyncio
@@ -17,10 +13,11 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
-import aiosqlite
 import discord
 from discord.ext import commands
 from PIL import Image, ImageDraw, ImageFont
+from aiogram import Bot as TGBot
+from aiogram.enums import ParseMode
 
 try:
     from dotenv import load_dotenv
@@ -66,21 +63,17 @@ SEED_ALERT_ROLE_ID = int(_seed_role) if _seed_role else None
 SEED_MAP_KEYWORDS = ["seed", "сид"]
 
 # ─────────────────────────────────────────────
-# Система увалов (отпуск/инактив)
+# TELEGRAM И ИНТЕГРАЦИЯ С APOLLO
 # ─────────────────────────────────────────────
-# Канал, где висит сообщение с кнопками "Уйти в увал" / "Отменить" (для игроков)
-_leave_channel = os.environ.get("LEAVE_CHANNEL_ID")
-LEAVE_CHANNEL_ID = int(_leave_channel) if _leave_channel else None
-# Канал, куда бот постит карточки увалов (для офицерского состава)
-_officer_leave_channel = os.environ.get("OFFICER_LEAVE_CHANNEL_ID")
-OFFICER_LEAVE_CHANNEL_ID = int(_officer_leave_channel) if _officer_leave_channel else None
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+_tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = int(_tg_chat) if _tg_chat else None
 
-# Файл SQLite-базы для хранения увалов. ВАЖНО: на Railway по умолчанию файловая
-# система эфемерна между РЕДЕПЛОЯМИ (обычные рестарты процесса файл не трогают).
-# Чтобы увалы переживали и редеплои — подключи Railway Volume и примонтируй его
-# на путь из LEAVES_DB_PATH (например /data), иначе база будет пересоздаваться
-# с нуля при каждом новом деплое.
-LEAVES_DB_PATH = _get_env("LEAVES_DB_PATH", required=False, default="leaves.db")
+# По умолчанию ID публичного бота Apollo = 475744554910351370
+_apollo_id = os.environ.get("APOLLO_BOT_ID", "475744554910351370")
+APOLLO_BOT_ID = int(_apollo_id) if _apollo_id else None
+
+tg_bot = TGBot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
 FLAGS_DIR = "flags"
 
@@ -96,12 +89,34 @@ logging.basicConfig(
 log = logging.getLogger("nw-online-bot")
 
 # ─────────────────────────────────────────────
-#  БОТ
+#  БОТ DISCORD
 # ─────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ─────────────────────────────────────────────
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ TELEGRAM
+# ─────────────────────────────────────────────
+
+async def send_to_telegram(text: str):
+    """Отправляет текстовое сообщение в Telegram-группу с разбивкой по лимиту 4096 символов."""
+    if not tg_bot or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram не сконфигурирован (нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID)")
+        return
+
+    # Разбиваем текст, если он больше 4000 символов
+    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+    for chunk in chunks:
+        try:
+            await tg_bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=chunk,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            log.error(f"Ошибка при отправке в Telegram: {e}")
 
 # ─────────────────────────────────────────────
 #  ГЕНЕРАЦИЯ PNG С ОНЛАЙНОМ
@@ -129,9 +144,6 @@ SERVER_LABELS = {
     "AAS": "МИКС",
     "Spec Ops": "SPEC OPS",
     "Custom": "CUSTOM",
-    # Если одновременно активно несколько физических Custom-серверов (ID 9/10/11
-    # из SQSTAT_SERVER_MAP) — они не сливаются в одну карточку, а получают
-    # отдельные подписи с суффиксом raw ID. Регистрируем заранее все возможные.
     "Custom 9": "CUSTOM 9",
     "Custom 10": "CUSTOM 10",
     "Custom 11": "CUSTOM 11",
@@ -386,9 +398,8 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
     buf.seek(0)
     return buf.read()
 
-
 # ─────────────────────────────────────────────
-#  ОПРОС API И ПУБЛИКАЦИЯ
+#  ОПРОС API И ПУБЛИКАЦИЯ ОНЛАЙНА
 # ─────────────────────────────────────────────
 
 _online_message_id: dict[int, int] = {}
@@ -471,7 +482,6 @@ async def _post_with_cookie(session: aiohttp.ClientSession, url: str, data: dict
 
 
 async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, clan_id: str, default_srv_prefix: str = None) -> dict:
-    """Запрашивает ростер, сервера и игроков с любого sqstat-сайта."""
     headers_clan = {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
@@ -495,7 +505,6 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
         )
         clan_data = json.loads(raw_clan)
 
-        # 1. Пополнение известных ников
         for p in clan_data.get("players", []):
             if isinstance(p, dict):
                 raw_name = (p.get("name") or "").strip()
@@ -503,7 +512,6 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
                 if bare:
                     result["roster_names"].add(bare)
 
-        # 2. Получение статы серверов (карта, суммарный онлайн)
         server_info = {}
         try:
             raw_pub = await _post_with_cookie(
@@ -520,15 +528,6 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
         except Exception as e:
             log.warning(f"{base_url} public.php error: {e}")
 
-        # 3. Парсинг текущего онлайна.
-        # ВАЖНО: несколько разных физических серверов (raw srv_id) могут вести в один
-        # и тот же ярлык (например SQSTAT_SERVER_MAP мапит ID 9/10/11 все в "Custom").
-        # Если такие сервера ОДНОВРЕМЕННО активны — их нельзя молча сливать в одну
-        # карточку: список игроков смешается, а бейдж карты/онлайна возьмёт данные
-        # только от первого попавшего туда игрока, показывая неверную цифру для
-        # остальных. Поэтому: считаем базовое имя для каждого активного srv_id,
-        # и если имя встречается больше одного раза среди активных — различаем
-        # суффиксом srv_id (та же логика, что уже была только для PSTN).
         active_ids = [sid for sid, sdata in clan_data.get("servers", {}).items() if sdata and not isinstance(sdata, list)]
 
         def _base_name(sid: str) -> str:
@@ -538,14 +537,6 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
         for sid in active_ids:
             bn = _base_name(sid)
             base_name_counts[bn] = base_name_counts.get(bn, 0) + 1
-
-        if active_ids:
-            dupes = {bn: c for bn, c in base_name_counts.items() if c > 1}
-            log.info(
-                f"{base_url}: активные srv_id={active_ids}, "
-                f"инфо от public.php по ним={ {sid: server_info.get(str(sid)) for sid in active_ids} }"
-                + (f", РАЗДЕЛЯЮ дубли: {dupes}" if dupes else "")
-            )
 
         for srv_id, srv_data in clan_data.get("servers", {}).items():
             if not srv_data or isinstance(srv_data, list):
@@ -584,23 +575,19 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
     return result
 
 async def fetch_online_data() -> dict | None:
-    """Парсит оба ресурса sqstat (Основной и PSTN) параллельно и объединяет выдачу."""
     grouped: dict[str, list] = {"Invasion": [], "AAS": [], "Spec Ops": [], "Custom": [], PSTN_LABEL: []}
 
     try:
         async with aiohttp.ClientSession() as session:
-            # Запускаем одновременно оба запроса
             main_task = _fetch_sqstat_instance(session, SQSTAT_BASE_URL, CLAN_ID)
             pstn_task = _fetch_sqstat_instance(session, PSTN_SQSTAT_BASE_URL, PSTN_CLAN_ID, default_srv_prefix=PSTN_LABEL)
 
             main_res, pstn_res = await asyncio.gather(main_task, pstn_task)
 
-            # Объединяем полученный ростер игроков
             _known_clan_names.update(main_res["roster_names"])
             _known_clan_names.update(pstn_res["roster_names"])
             _log_roster_dump()
 
-            # Функция фильтрации игроков по тегам или по ростеру
             def filter_players(players_list):
                 matched = []
                 for p in players_list:
@@ -612,11 +599,9 @@ async def fetch_online_data() -> dict | None:
                         matched.append(p)
                 return matched
 
-            # Формируем результаты основной группы
             for srv_name, players in main_res["players_by_server"].items():
                 grouped.setdefault(srv_name, []).extend(filter_players(players))
 
-            # Формируем результаты PSTN группы
             for srv_name, players in pstn_res["players_by_server"].items():
                 grouped.setdefault(srv_name, []).extend(filter_players(players))
 
@@ -748,11 +733,9 @@ async def start_online_loop():
             log.error(f"Ошибка онлайн-цикла: {e}", exc_info=True)
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-
 # ─────────────────────────────────────────────
-#  ОТЛАДОЧНЫЕ КОМАНДЫ
+#  КОМАНДЫ DISCORD
 # ─────────────────────────────────────────────
-
 
 def _chunk_text(text: str, limit: int = 1900):
     lines = text.split("\n")
@@ -782,364 +765,63 @@ async def cmd_roster(ctx: commands.Context):
         await ctx.send(text)
 
 
+@bot.command(name="tgsend")
+async def cmd_tg_send(ctx: commands.Context, *, text: str):
+    """Отправляет произвольное сообщение в подключённый Telegram-чат."""
+    if not tg_bot or not TELEGRAM_CHAT_ID:
+        await ctx.send("Интеграция с Telegram не настроена на сервере (проверь .env).")
+        return
+
+    formatted_text = f"<b>Сообщение от {ctx.author.display_name}:</b>\n\n{text}"
+    await send_to_telegram(formatted_text)
+    await ctx.send("✅ Сообщение успешно переслано в Telegram!")
+
 # ─────────────────────────────────────────────
-#  СИСТЕМА УВАЛОВ (ОТПУСК/ИНАКТИВ) — БД
+#  ОБРАБОТКА СООБЩЕНИЙ (КРОССПОСТИНГ APOLLO)
 # ─────────────────────────────────────────────
 
-# Кэш активных увалов в памяти для быстрых проверок (user_id -> запись из БД).
-# Источник истины — SQLite (LEAVES_DB_PATH), кэш просто зеркалит его и грузится
-# заново из БД при каждом старте бота (см. on_ready), так что рестарты процесса
-# ничего не теряют. Теряется только при полном редеплое БЕЗ примонтированного
-# Railway Volume — см. комментарий у LEAVES_DB_PATH.
-_active_leaves: dict[int, dict] = {}
-
-
-async def db_init():
-    async with aiosqlite.connect(LEAVES_DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS leaves (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                user_name TEXT,
-                days INTEGER NOT NULL,
-                reason TEXT,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                officer_message_id INTEGER,
-                status TEXT NOT NULL DEFAULT 'active',
-                added_by TEXT
-            )
-        """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_leaves_user_status ON leaves(user_id, status)")
-        await db.commit()
-    log.info(f"БД увалов инициализирована: {LEAVES_DB_PATH}")
-
-
-async def db_add_leave(user_id: int, user_name: str, days: int, reason: str,
-                        officer_message_id: int | None, added_by: str = "self") -> int:
-    started = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(LEAVES_DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO leaves (user_id, user_name, days, reason, started_at, officer_message_id, status, added_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'active', ?)",
-            (user_id, user_name, days, reason, started, officer_message_id, added_by),
-        )
-        await db.commit()
-        return cur.lastrowid
-
-
-async def db_cancel_leave(user_id: int) -> dict | None:
-    ended = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(LEAVES_DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM leaves WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", (user_id,)
-        )
-        row = await cur.fetchone()
-        if not row:
-            return None
-        await db.execute("UPDATE leaves SET status = 'cancelled', ended_at = ? WHERE id = ?", (ended, row["id"]))
-        await db.commit()
-        return dict(row)
-
-
-async def db_get_active_leaves() -> list[dict]:
-    async with aiosqlite.connect(LEAVES_DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM leaves WHERE status = 'active' ORDER BY started_at")
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
-
-
-async def db_get_active_leave(user_id: int) -> dict | None:
-    async with aiosqlite.connect(LEAVES_DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM leaves WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", (user_id,)
-        )
-        row = await cur.fetchone()
-        return dict(row) if row else None
-
-
-async def _load_active_leaves_cache():
-    """Вызывается при старте бота — подтягивает активные увалы из БД в память."""
-    _active_leaves.clear()
-    for row in await db_get_active_leaves():
-        _active_leaves[row["user_id"]] = row
-    log.info(f"Увалы: загружено из БД активных записей — {len(_active_leaves)}")
-
-
-def _leave_embed(member: discord.Member | discord.User, days: int, reason: str,
-                  cancelled: bool = False, migrated: bool = False) -> discord.Embed:
-    if cancelled:
-        title = "✅ Увал завершён"
-        color = discord.Color.green()
-    elif migrated:
-        title = "🌴 Увал (перенесён вручную)"
-        color = discord.Color.gold()
-    else:
-        title = "🌴 Новый увал"
-        color = discord.Color.orange()
-    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Игрок", value=member.mention, inline=True)
-    embed.add_field(name="Дней в инактиве", value=str(days), inline=True)
-    embed.add_field(name="Причина", value=reason or "—", inline=False)
-    embed.set_footer(text=f"ID: {member.id}")
-    return embed
-
-
-class LeaveModal(discord.ui.Modal, title="Уйти в увал"):
-    days = discord.ui.TextInput(
-        label="Сколько дней в инактиве",
-        placeholder="Например: 7",
-        required=True,
-        max_length=4,
-    )
-    reason = discord.ui.TextInput(
-        label="Причина",
-        style=discord.TextStyle.paragraph,
-        placeholder="Коротко опиши причину увала",
-        required=True,
-        max_length=500,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        raw_days = self.days.value.strip()
-        if not raw_days.isdigit() or not (0 < int(raw_days) <= 365):
-            await interaction.response.send_message(
-                "Количество дней должно быть числом от 1 до 365. Попробуй ещё раз через кнопку.",
-                ephemeral=True,
-            )
-            return
-        days_val = int(raw_days)
-        reason_val = self.reason.value.strip()
-
-        member = interaction.user
-        embed = _leave_embed(member, days_val, reason_val)
-
-        officer_msg_id = None
-        if OFFICER_LEAVE_CHANNEL_ID:
-            officer_channel = bot.get_channel(OFFICER_LEAVE_CHANNEL_ID)
-            if officer_channel:
-                try:
-                    msg = await officer_channel.send(embed=embed)
-                    officer_msg_id = msg.id
-                except Exception as e:
-                    log.error(f"Не удалось отправить карточку увала офицерам: {e}")
-            else:
-                log.warning(f"OFFICER_LEAVE_CHANNEL_ID={OFFICER_LEAVE_CHANNEL_ID} — канал не найден")
-        else:
-            log.warning("OFFICER_LEAVE_CHANNEL_ID не задан — карточка увала никуда не отправлена")
-
-        leave_id = await db_add_leave(member.id, str(member), days_val, reason_val, officer_msg_id, added_by="self")
-        _active_leaves[member.id] = {
-            "id": leave_id,
-            "user_id": member.id,
-            "user_name": str(member),
-            "days": days_val,
-            "reason": reason_val,
-            "officer_message_id": officer_msg_id,
-            "status": "active",
-        }
-
-        await interaction.response.send_message(
-            f"Увал оформлен на {days_val} дн. Хорошего отдыха! Вернёшься — жми «Отменить» на этом же сообщении.",
-            ephemeral=True,
-        )
-        log.info(f"Увал: {member} ({member.id}) — {days_val} дн., причина: {reason_val!r}")
-
-
-class LeaveView(discord.ui.View):
-    """Постоянные кнопки. custom_id фиксированный, чтобы работать и после рестарта бота."""
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Уйти в увал", style=discord.ButtonStyle.primary, emoji="🌴", custom_id="nw_leave_go")
-    async def go_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id in _active_leaves:
-            await interaction.response.send_message(
-                "У тебя уже оформлен увал. Сначала нажми «Отменить», если хочешь оформить новый.",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.send_modal(LeaveModal())
-
-    @discord.ui.button(label="Отменить", style=discord.ButtonStyle.secondary, emoji="↩️", custom_id="nw_leave_cancel")
-    async def cancel_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-        _active_leaves.pop(interaction.user.id, None)
-        leave = await db_cancel_leave(interaction.user.id)
-        if not leave:
-            await interaction.response.send_message("У тебя сейчас нет активного увала.", ephemeral=True)
-            return
-
-        if OFFICER_LEAVE_CHANNEL_ID and leave.get("officer_message_id"):
-            officer_channel = bot.get_channel(OFFICER_LEAVE_CHANNEL_ID)
-            if officer_channel:
-                try:
-                    msg = await officer_channel.fetch_message(leave["officer_message_id"])
-                    updated = _leave_embed(interaction.user, leave["days"], leave["reason"], cancelled=True)
-                    await msg.edit(embed=updated)
-                except discord.NotFound:
-                    pass
-                except Exception as e:
-                    log.warning(f"Не удалось обновить карточку увала при отмене: {e}")
-
-        await interaction.response.send_message("Увал отменён, с возвращением! 👋", ephemeral=True)
-        log.info(f"Увал отменён: {interaction.user} ({interaction.user.id})")
-
-
-@bot.command(name="leavepanel")
-@commands.has_permissions(manage_guild=True)
-async def cmd_leave_panel(ctx: commands.Context):
-    """Публикует (или переpubликует) панель с кнопками увала в LEAVE_CHANNEL_ID."""
-    if not LEAVE_CHANNEL_ID:
-        await ctx.send("LEAVE_CHANNEL_ID не задан в переменных окружения — некуда постить панель.")
-        return
-    channel = bot.get_channel(LEAVE_CHANNEL_ID)
-    if not channel:
-        await ctx.send(f"Канал LEAVE_CHANNEL_ID={LEAVE_CHANNEL_ID} не найден (бот туда не добавлен?).")
+@bot.event
+async def on_message(message: discord.Message):
+    # Не пересылаем сообщения от самого бота
+    if message.author == bot.user:
         return
 
-    embed = discord.Embed(
-        title="🌴 Увал",
-        description=(
-            "Уходишь в отпуск от игры — нажми **Уйти в увал** и заполни форму "
-            "(сколько дней и причина). Офицерский состав увидит карточку с твоим ником и аватаркой.\n\n"
-            "Вернулся раньше срока — жми **Отменить**."
-        ),
-        color=discord.Color.blurple(),
-    )
-    await channel.send(embed=embed, view=LeaveView())
-    if channel.id != ctx.channel.id:
-        await ctx.send(f"Готово, панель опубликована в {channel.mention}.")
+    # Перехват сообщений от Apollo Bot
+    if APOLLO_BOT_ID and message.author.id == APOLLO_BOT_ID:
+        tg_text_parts = [f"📢 <b>Объявление о тренировке (Apollo):</b>"]
 
+        if message.content:
+            tg_text_parts.append(f"\n{message.content}")
 
-@cmd_leave_panel.error
-async def cmd_leave_panel_error(ctx: commands.Context, error: commands.CommandError):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("Эта команда доступна только тем, у кого есть право «Управление сервером».")
-    else:
-        log.error(f"cmd_leave_panel: {error}", exc_info=True)
+        # Парсинг embeds (карточек событий от Apollo)
+        for embed in message.embeds:
+            if embed.title:
+                tg_text_parts.append(f"\n<b>{embed.title}</b>")
+            if embed.description:
+                tg_text_parts.append(f"{embed.description}")
+            for field in embed.fields:
+                tg_text_parts.append(f"\n<b>{field.name}</b>\n{field.value}")
 
+        final_text = "\n".join(tg_text_parts)
+        await send_to_telegram(final_text)
+        log.info(f"Переслано объявление Apollo в Telegram из канала #{message.channel}")
 
-@bot.command(name="addleave")
-@commands.has_permissions(manage_guild=True)
-async def cmd_add_leave(ctx: commands.Context, member: discord.Member, days: int, *, reason: str):
-    """
-    Миграция/ручное добавление увала офицером за игрока.
-    Использование: !addleave @Игрок 14 причина текстом до конца строки
-    """
-    if not (0 < days <= 365):
-        await ctx.send("Количество дней должно быть от 1 до 365.")
-        return
-    if member.id in _active_leaves:
-        await ctx.send(f"У {member.mention} уже есть активный увал в системе — сначала `!removeleave` его.")
-        return
-
-    embed = _leave_embed(member, days, reason, migrated=True)
-    officer_msg_id = None
-    if OFFICER_LEAVE_CHANNEL_ID:
-        officer_channel = bot.get_channel(OFFICER_LEAVE_CHANNEL_ID)
-        if officer_channel:
-            try:
-                msg = await officer_channel.send(embed=embed)
-                officer_msg_id = msg.id
-            except Exception as e:
-                log.error(f"Не удалось отправить карточку увала (миграция): {e}")
-
-    leave_id = await db_add_leave(member.id, str(member), days, reason, officer_msg_id, added_by=str(ctx.author))
-    _active_leaves[member.id] = {
-        "id": leave_id,
-        "user_id": member.id,
-        "user_name": str(member),
-        "days": days,
-        "reason": reason,
-        "officer_message_id": officer_msg_id,
-        "status": "active",
-    }
-    await ctx.send(f"Увал для {member.mention} добавлен ({days} дн., перенесено вручную).")
-    log.info(f"Увал добавлен вручную ({ctx.author}): {member} ({member.id}) — {days} дн., причина: {reason!r}")
-
-
-@bot.command(name="removeleave")
-@commands.has_permissions(manage_guild=True)
-async def cmd_remove_leave(ctx: commands.Context, member: discord.Member):
-    """Снимает увал с игрока за него (если сам не может/не хочет нажать кнопку)."""
-    _active_leaves.pop(member.id, None)
-    leave = await db_cancel_leave(member.id)
-    if not leave:
-        await ctx.send(f"У {member.mention} нет активного увала.")
-        return
-
-    if OFFICER_LEAVE_CHANNEL_ID and leave.get("officer_message_id"):
-        officer_channel = bot.get_channel(OFFICER_LEAVE_CHANNEL_ID)
-        if officer_channel:
-            try:
-                msg = await officer_channel.fetch_message(leave["officer_message_id"])
-                updated = _leave_embed(member, leave["days"], leave["reason"], cancelled=True)
-                await msg.edit(embed=updated)
-            except discord.NotFound:
-                pass
-            except Exception as e:
-                log.warning(f"Не удалось обновить карточку увала при снятии: {e}")
-
-    await ctx.send(f"Увал для {member.mention} снят.")
-    log.info(f"Увал снят вручную ({ctx.author}): {member} ({member.id})")
-
-
-@bot.command(name="activeleaves")
-@commands.has_permissions(manage_guild=True)
-async def cmd_active_leaves(ctx: commands.Context):
-    """Список всех активных увалов прямо из БД."""
-    rows = await db_get_active_leaves()
-    if not rows:
-        await ctx.send("Активных увалов нет.")
-        return
-    lines = []
-    for r in rows:
-        started = r["started_at"][:10] if r.get("started_at") else "?"
-        lines.append(f"<@{r['user_id']}> — {r['days']} дн., с {started}, причина: {r['reason']}")
-    body = "\n".join(lines)
-    for chunk in _chunk_text(body, 1900):
-        await ctx.send(chunk)
-
-
-for _cmd in (cmd_add_leave, cmd_remove_leave, cmd_active_leaves):
-    @_cmd.error
-    async def _leave_cmd_error(ctx: commands.Context, error: commands.CommandError):
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.send("Эта команда доступна только тем, у кого есть право «Управление сервером».")
-        elif isinstance(error, commands.MemberNotFound):
-            await ctx.send("Не нашёл такого участника — упомяни его через @.")
-        elif isinstance(error, commands.BadArgument):
-            await ctx.send("Проверь аргументы команды, например: `!addleave @Игрок 14 причина`.")
-        elif isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send("Не хватает аргументов, например: `!addleave @Игрок 14 причина`.")
-        else:
-            log.error(f"leave command error: {error}", exc_info=True)
-
+    # Важно, чтобы обычные команды (!roster, !tgsend) продолжали работать
+    await bot.process_commands(message)
 
 # ─────────────────────────────────────────────
 #  СОБЫТИЯ БОТА
 # ─────────────────────────────────────────────
 
-
 @bot.event
 async def on_ready():
     log.info(f"Бот запущен: {bot.user} ({bot.user.id})")
     log.info(f"Фильтр тегов клана: {CLAN_TAGS}")
-    bot.add_view(LeaveView())  # чтобы кнопки увала работали и после рестарта бота
-    await db_init()
-    await _load_active_leaves_cache()
-    if LEAVE_CHANNEL_ID and OFFICER_LEAVE_CHANNEL_ID:
-        log.info(f"Увалы: канал игроков {LEAVE_CHANNEL_ID}, канал офицеров {OFFICER_LEAVE_CHANNEL_ID}")
+    if tg_bot and TELEGRAM_CHAT_ID:
+        log.info(f"Интеграция с Telegram активна (Chat ID: {TELEGRAM_CHAT_ID})")
     else:
-        log.warning(
-            "Увалы: не заданы LEAVE_CHANNEL_ID и/или OFFICER_LEAVE_CHANNEL_ID — "
-            "система увалов не будет работать, пока обе переменные не заданы"
-        )
+        log.warning("Telegram-интеграция отключена: проверь TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID")
+
     asyncio.create_task(start_online_loop())
 
 
