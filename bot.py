@@ -11,6 +11,7 @@ import os
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
+import html  # Убедись, что импорт добавлен вверху файла!
 
 import aiohttp
 import discord
@@ -792,33 +793,41 @@ async def cmd_tg_send(ctx: commands.Context, *, text: str):
 #  ОБРАБОТКА СООБЩЕНИЙ (КРОССПОСТИНГ APOLLO)
 # ─────────────────────────────────────────────
 
+
+
 @bot.event
 async def on_message(message: discord.Message):
-    # Не пересылаем сообщения от самого бота
     if message.author == bot.user:
         return
 
     # Перехват сообщений от Apollo Bot
     if APOLLO_BOT_ID and message.author.id == APOLLO_BOT_ID:
-        tg_text_parts = [f"📢 <b>Объявление о тренировке (Apollo):</b>"]
+        tg_text_parts = ["📢 <b>Объявление о тренировке (Apollo):</b>"]
 
+        # 1. Основное содержимое сообщения
         if message.content:
-            tg_text_parts.append(f"\n{message.content}")
+            # Очищаем упоминания Discord вида <@&12345> или <@12345>
+            clean_content = re.sub(r"<@&?\d+>", "", message.content).strip()
+            if clean_content:
+                tg_text_parts.append(f"\n{html.escape(clean_content)}")
 
-        # Парсинг embeds (карточек событий от Apollo)
+        # 2. Обработка карточек (Embeds)
         for embed in message.embeds:
             if embed.title:
-                tg_text_parts.append(f"\n<b>{embed.title}</b>")
+                tg_text_parts.append(f"\n<b>{html.escape(embed.title)}</b>")
             if embed.description:
-                tg_text_parts.append(f"{embed.description}")
+                clean_desc = re.sub(r"<@&?\d+>", "", embed.description)
+                tg_text_parts.append(f"{html.escape(clean_desc)}")
             for field in embed.fields:
-                tg_text_parts.append(f"\n<b>{field.name}</b>\n{field.value}")
+                clean_value = re.sub(r"<@&?\d+>", "", field.value)
+                tg_text_parts.append(
+                    f"\n<b>{html.escape(field.name)}</b>\n{html.escape(clean_value)}"
+                )
 
         final_text = "\n".join(tg_text_parts)
         await send_to_telegram(final_text)
         log.info(f"Переслано объявление Apollo в Telegram из канала #{message.channel}")
 
-    # Важно, чтобы обычные команды (!roster, !tgsend) продолжали работать
     await bot.process_commands(message)
 
 # ─────────────────────────────────────────────
