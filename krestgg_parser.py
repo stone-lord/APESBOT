@@ -23,20 +23,18 @@ BROWSER_ARGS = [
 
 
 def _build_clan_pattern() -> re.Pattern:
-    """Динамически формирует регулярное выражение для поиска точных клан-тегов из .env."""
+    """Динамически формирует регулярное выражение для поиска клан-тегов из .env."""
     env_tags = os.getenv("CLAN_TAG_FILTER", "❀A❀, APES, ✿A✿")
 
-    # Разбиваем теги по запятой и экранируем спецсимволы (цветочки, знаки)
     tags = [re.escape(tag.strip()) for tag in env_tags.split(",") if tag.strip()]
 
     if not tags:
         tags = [re.escape("❀A❀"), re.escape("APES"), re.escape("✿A✿")]
 
     tags_joined = "|".join(tags)
-    print(tags_joined)
-    # Ищет точное совпадение тегов без добавления скобок
-    # (?:^|\s+) — тег идет в начале строки или после пробела
-    pattern_str = rf"(?:^|\s+)({tags_joined})"
+
+    # Ищет сам тег без обязательных внешних рамок
+    pattern_str = rf"({tags_joined})"
     return re.compile(pattern_str, re.IGNORECASE)
 
 class KrestGGParser:
@@ -109,6 +107,7 @@ class KrestGGParser:
         tag_pattern = _build_clan_pattern()
 
         try:
+            # Находим все текстовые элементы с тегами
             elements = await page.get_by_text(tag_pattern).all()
 
             for el in elements:
@@ -117,19 +116,18 @@ class KrestGGParser:
                     if not text:
                         continue
 
-                    # Ищем тег и забираем все, что идет после него (никнейм)
-                    match = re.search(
-                        tag_pattern.pattern + r"\s*(.+?)(?:В\s*друзья|$)",
-                        text,
-                        re.IGNORECASE | re.DOTALL
-                    )
-                    if match:
-                        # group(1) — сам тег, group(2) — никнейм после тега
-                        nick = match.group(2).strip()
-                        nick = re.sub(r'<[^>]+>', '', nick).strip()
+                    # Очищаем системный мусор (кнопку "В друзья" и HTML-теги)
+                    text_clean = re.sub(r'<[^>]+>', '', text)
+                    text_clean = re.sub(r'В\s*друзья.*', '', text_clean, flags=re.IGNORECASE).strip()
 
-                        if 3 <= len(nick) <= 25:
-                            players.add(nick)
+                    # Если в очищенной строке есть наш клан-тег
+                    if tag_pattern.search(text_clean):
+                        # Если строка содержит имя вроде "❀APES❀ stl", берем её полностью
+                        full_nick = text_clean.strip()
+
+                        if 3 <= len(full_nick) <= 30:
+                            players.add(full_nick)
+
                 except Exception:
                     continue
         except Exception as e:
