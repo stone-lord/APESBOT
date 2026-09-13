@@ -37,6 +37,8 @@ def _build_clan_pattern() -> re.Pattern:
     # Ищем любой из тегов в тексте (без строгого ограничения по пробелам)
     pattern_str = rf"({tags_joined})"
     return re.compile(pattern_str, re.IGNORECASE)
+
+
 class KrestGGParser:
     def __init__(self, timeout: int = 15000):
         self.timeout = timeout
@@ -102,13 +104,13 @@ class KrestGGParser:
                     except Exception:
                         pass
 
+    @staticmethod
     async def _extract_pet_players(page) -> List[str]:
         players = set()
         tag_pattern = _build_clan_pattern()
 
         try:
             # Извлекаем весь видимый текст со страницы целиком
-            # Это решает проблему со сложной слоистой версткой и разбиением по элементам
             page_text = await page.evaluate("() => document.body.innerText")
 
             if not page_text:
