@@ -26,6 +26,7 @@ def _build_clan_pattern() -> re.Pattern:
     """Динамически формирует регулярное выражение для поиска клан-тегов из .env."""
     env_tags = os.getenv("CLAN_TAG_FILTER", "❀A❀, APES, ✿A✿")
 
+    # Разбиваем теги по запятой и экранируем спецсимволы
     tags = [re.escape(tag.strip()) for tag in env_tags.split(",") if tag.strip()]
 
     if not tags:
@@ -33,10 +34,9 @@ def _build_clan_pattern() -> re.Pattern:
 
     tags_joined = "|".join(tags)
 
-    # Ищет сам тег без обязательных внешних рамок
+    # Ищем любой из тегов в тексте (без строгого ограничения по пробелам)
     pattern_str = rf"({tags_joined})"
     return re.compile(pattern_str, re.IGNORECASE)
-
 class KrestGGParser:
     def __init__(self, timeout: int = 15000):
         self.timeout = timeout
@@ -102,39 +102,40 @@ class KrestGGParser:
                     except Exception:
                         pass
 
-    async def _extract_pet_players(self, page) -> List[str]:
+    async def _extract_pet_players(page) -> List[str]:
         players = set()
         tag_pattern = _build_clan_pattern()
 
         try:
-            # Находим все текстовые элементы с тегами
-            elements = await page.get_by_text(tag_pattern).all()
+            # Извлекаем весь видимый текст со страницы целиком
+            # Это решает проблему со сложной слоистой версткой и разбиением по элементам
+            page_text = await page.evaluate("() => document.body.innerText")
 
-            for el in elements:
-                try:
-                    text = await el.text_content()
-                    if not text:
-                        continue
+            if not page_text:
+                return []
 
-                    # Очищаем системный мусор (кнопку "В друзья" и HTML-теги)
-                    text_clean = re.sub(r'<[^>]+>', '', text)
-                    text_clean = re.sub(r'В\s*друзья.*', '', text_clean, flags=re.IGNORECASE).strip()
+            # Разбиваем текст страницы на отдельные строки
+            lines = page_text.splitlines()
 
-                    # Если в очищенной строке есть наш клан-тег
-                    if tag_pattern.search(text_clean):
-                        # Если строка содержит имя вроде "❀APES❀ stl", берем её полностью
-                        full_nick = text_clean.strip()
-
-                        if 3 <= len(full_nick) <= 30:
-                            players.add(full_nick)
-
-                except Exception:
+            for line in lines:
+                line_clean = line.strip()
+                if not line_clean:
                     continue
+
+                # Проверяем, есть ли в текущей строке один из клан-тегов
+                if tag_pattern.search(line_clean):
+                    # Очищаем системный текст интерфейса сайта
+                    nick = re.sub(r'В\s*друзья.*', '', line_clean, flags=re.IGNORECASE).strip()
+                    nick = re.sub(r'\s+', ' ', nick)  # Убираем дублирующиеся пробелы
+
+                    # Если строка похожа на никнейм (а не на фрагмент интерфейса)
+                    if 3 <= len(nick) <= 35:
+                        players.add(nick)
+
         except Exception as e:
             logger.debug(f"Ошибка парсинга игроков: {e}")
 
         return list(players)
-
 
 
 krest_parser = KrestGGParser()
