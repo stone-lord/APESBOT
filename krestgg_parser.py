@@ -23,21 +23,21 @@ BROWSER_ARGS = [
 
 
 def _build_clan_pattern() -> re.Pattern:
-    """Динамически формирует регулярное выражение для поиска клан-тегов из .env."""
-    env_tags = os.getenv("CLAN_TAG_FILTER", "PET")
+    """Динамически формирует регулярное выражение для поиска точных клан-тегов из .env."""
+    env_tags = os.getenv("CLAN_TAG_FILTER", "❀A❀, APES, ✿A✿")
 
-    # Разбиваем теги по запятой и экранируем спецсимволы
+    # Разбиваем теги по запятой и экранируем спецсимволы (цветочки, знаки)
     tags = [re.escape(tag.strip()) for tag in env_tags.split(",") if tag.strip()]
 
     if not tags:
-        tags = ["PET"]
+        tags = [re.escape("❀A❀"), re.escape("APES"), re.escape("✿A✿")]
 
     tags_joined = "|".join(tags)
-
-    # Паттерн ищет теги в квадратных скобках [TAG] или с пайпами | TAG |
-    pattern_str = rf"(?:\[({tags_joined})\]|\|\s*({tags_joined})\s*\|)"
+    print(tags_joined)
+    # Ищет точное совпадение тегов без добавления скобок
+    # (?:^|\s+) — тег идет в начале строки или после пробела
+    pattern_str = rf"(?:^|\s+)({tags_joined})"
     return re.compile(pattern_str, re.IGNORECASE)
-
 
 class KrestGGParser:
     def __init__(self, timeout: int = 15000):
@@ -117,15 +117,15 @@ class KrestGGParser:
                     if not text:
                         continue
 
-                    # Извлекаем никнейм после тега до фрагментов UI (например, "В друзья")
+                    # Ищем тег и забираем все, что идет после него (никнейм)
                     match = re.search(
                         tag_pattern.pattern + r"\s*(.+?)(?:В\s*друзья|$)",
                         text,
                         re.IGNORECASE | re.DOTALL
                     )
                     if match:
-                        # Так как в паттерне 2 группы захвата (для [] и ||), берём последнюю группу регулярки с ником
-                        nick = match.group(match.lastindex).strip()
+                        # group(1) — сам тег, group(2) — никнейм после тега
+                        nick = match.group(2).strip()
                         nick = re.sub(r'<[^>]+>', '', nick).strip()
 
                         if 3 <= len(nick) <= 25:
@@ -136,6 +136,7 @@ class KrestGGParser:
             logger.debug(f"Ошибка парсинга игроков: {e}")
 
         return list(players)
+
 
 
 krest_parser = KrestGGParser()
