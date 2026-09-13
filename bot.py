@@ -12,7 +12,7 @@ import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 import html  # Убедись, что импорт добавлен вверху файла!
-
+from krestgg_parser import krest_parser
 import aiohttp
 import discord
 from discord.ext import commands
@@ -575,18 +575,41 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
 
     return result
 
+from krestgg_parser import krest_parser
+
+
 async def fetch_online_data() -> dict | None:
-    grouped: dict[str, list] = {"Invasion": [], "AAS": [], "Spec Ops": [], "Custom": [], PSTN_LABEL: []}
+    grouped: dict[str, list] = {
+        "Invasion": [],
+        "AAS": [],
+        "Spec Ops": [],
+        "Custom": [],
+        PSTN_LABEL: [],
+    }
 
     try:
         async with aiohttp.ClientSession() as session:
-            main_task = _fetch_sqstat_instance(session, SQSTAT_BASE_URL, CLAN_ID)
-            pstn_task = _fetch_sqstat_instance(session, PSTN_SQSTAT_BASE_URL, PSTN_CLAN_ID, default_srv_prefix=PSTN_LABEL)
+            main_task = _fetch_sqstat_instance(
+                session, SQSTAT_BASE_URL, CLAN_ID
+            )
+            pstn_task = _fetch_sqstat_instance(
+                session,
+                PSTN_SQSTAT_BASE_URL,
+                PSTN_CLAN_ID,
+                default_srv_prefix=PSTN_LABEL,
+            )
+            # Параллельный запуск BSS, PSTN и KREST.GG
+            krest_task = krest_parser.get_pet_online_by_server()
 
-            main_res, pstn_res = await asyncio.gather(main_task, pstn_task)
+            main_res, pstn_res, krest_res = await asyncio.gather(
+                main_task, pstn_task, krest_task, return_exceptions=True
+            )
 
-            _known_clan_names.update(main_res["roster_names"])
-            _known_clan_names.update(pstn_res["roster_names"])
+            # Безопасная обработка BSS и PSTN
+            if isinstance(main_res, dict):
+                _known_clan_names.update(main_res.get("roster_names", set()))
+            if isinstance(pstn_res, dict):
+                _known_clan_names.update(pstn_res.get("roster_names", set()))
             _log_roster_dump()
 
             def filter_players(players_list):
@@ -600,11 +623,36 @@ async def fetch_online_data() -> dict | None:
                         matched.append(p)
                 return matched
 
-            for srv_name, players in main_res["players_by_server"].items():
-                grouped.setdefault(srv_name, []).extend(filter_players(players))
+            if isinstance(main_res, dict):
+                for srv_name, players in main_res.get(
+                    "players_by_server", {}
+                ).items():
+                    grouped.setdefault(srv_name, []).extend(
+                        filter_players(players)
+                    )
 
-            for srv_name, players in pstn_res["players_by_server"].items():
-                grouped.setdefault(srv_name, []).extend(filter_players(players))
+            if isinstance(pstn_res, dict):
+                for srv_name, players in pstn_res.get(
+                    "players_by_server", {}
+                ).items():
+                    grouped.setdefault(srv_name, []).extend(
+                        filter_players(players)
+                    )
+
+            # Добавление результатов krest.gg
+            if isinstance(krest_res, dict):
+                for srv_name, players_nicks in krest_res.items():
+                    formatted_krest_players = [
+                        {
+                            "name": nick,
+                            "bare_name": nick,
+                            "team": "Krest.GG",
+                        }
+                        for nick in players_nicks
+                    ]
+                    grouped.setdefault(srv_name, []).extend(
+                        filter_players(formatted_krest_players)
+                    )
 
     except Exception as e:
         log.error(f"fetch_online_data error: {e}", exc_info=True)
@@ -620,7 +668,11 @@ async def fetch_online_data() -> dict | None:
             by_team.setdefault(team, []).append(p)
         servers_with_teams[server] = {"players": players, "by_team": by_team}
 
-    return {"status": "success", "total_online": total_online, "servers": servers_with_teams}
+    return {
+        "status": "success",
+        "total_online": total_online,
+        "servers": servers_with_teams,
+    }
 
 
 def is_seed_map(map_name: str) -> bool:
