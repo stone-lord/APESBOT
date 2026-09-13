@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     libnspr4 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
-    libcup2 \
+    libcups2 \
     libdrm2 \
     libxkbcommon0 \
     libxcomposite1 \
@@ -25,7 +25,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Установка бразуера Chromium для Playwright
+# Установка Chromium для Playwright
 RUN playwright install chromium
 
 COPY . .
