@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import logging
@@ -21,6 +22,23 @@ BROWSER_ARGS = [
 ]
 
 
+def _build_clan_pattern() -> re.Pattern:
+    """Динамически формирует регулярное выражение для поиска клан-тегов из .env."""
+    env_tags = os.getenv("CLAN_TAG_FILTER", "PET")
+
+    # Разбиваем теги по запятой и экранируем спецсимволы
+    tags = [re.escape(tag.strip()) for tag in env_tags.split(",") if tag.strip()]
+
+    if not tags:
+        tags = ["PET"]
+
+    tags_joined = "|".join(tags)
+
+    # Паттерн ищет теги в квадратных скобках [TAG] или с пайпами | TAG |
+    pattern_str = rf"(?:\[({tags_joined})\]|\|\s*({tags_joined})\s*\|)"
+    return re.compile(pattern_str, re.IGNORECASE)
+
+
 class KrestGGParser:
     def __init__(self, timeout: int = 15000):
         self.timeout = timeout
@@ -35,16 +53,16 @@ class KrestGGParser:
         result = {}
 
         async with async_playwright() as p:
+            browser = None
             try:
                 browser = await p.chromium.launch(headless=True, args=BROWSER_ARGS)
                 context = await browser.new_context(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    viewport={"width": 1440, "height": 900}
+                    viewport={"width": 1920, "height": 1080}
                 )
                 page = await context.new_page()
 
                 await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=self.timeout)
-                await page.wait_for_load_state("networkidle", timeout=10000)
                 await page.wait_for_timeout(2000)
 
                 for srv in SERVERS_TO_CHECK:
@@ -56,7 +74,9 @@ class KrestGGParser:
                             clean_name = re.sub(r'\s*\d+/\d+.*', '', raw_name).strip()
 
                             logger.info(f"🔄 Переключаю на: {clean_name}")
-                            await btn.click(force=True)
+
+                            await btn.scroll_into_view_if_needed()
+                            await btn.evaluate("el => el.click()")
                             await page.wait_for_timeout(1500)
 
                             players = await self._extract_pet_players(page)
@@ -78,19 +98,17 @@ class KrestGGParser:
                 logger.error(f"❌ Глобальная ошибка парсинга krest.gg: {e}")
                 return {}
             finally:
-                try:
-                    await browser.close()
-                except:
-                    pass
+                if browser:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
 
     async def _extract_pet_players(self, page) -> List[str]:
         players = set()
-        try:
-            tag_pattern = re.compile(
-                r"(?:\[PET[sStTpP]?\]|\|\s*PET[sStTpP]?\s*\|)",
-                re.IGNORECASE
-            )
+        tag_pattern = _build_clan_pattern()
 
+        try:
             elements = await page.get_by_text(tag_pattern).all()
 
             for el in elements:
@@ -99,18 +117,20 @@ class KrestGGParser:
                     if not text:
                         continue
 
+                    # Извлекаем никнейм после тега до фрагментов UI (например, "В друзья")
                     match = re.search(
-                        r"(?:\[PET[sStTpP]?\]|\|\s*PET[sStTpP]?\s*\|)\s*(.+?)(?:В\s*друзья|$)",
+                        tag_pattern.pattern + r"\s*(.+?)(?:В\s*друзья|$)",
                         text,
                         re.IGNORECASE | re.DOTALL
                     )
                     if match:
-                        nick = match.group(1).strip()
+                        # Так как в паттерне 2 группы захвата (для [] и ||), берём последнюю группу регулярки с ником
+                        nick = match.group(match.lastindex).strip()
                         nick = re.sub(r'<[^>]+>', '', nick).strip()
 
                         if 3 <= len(nick) <= 25:
                             players.add(nick)
-                except:
+                except Exception:
                     continue
         except Exception as e:
             logger.debug(f"Ошибка парсинга игроков: {e}")
