@@ -11,14 +11,16 @@ import os
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
-import html  # Убедись, что импорт добавлен вверху файла!
-from krestgg_parser import krest_parser
+import html
 import aiohttp
 import discord
 from discord.ext import commands
 from PIL import Image, ImageDraw, ImageFont
 from aiogram import Bot as TGBot
 from aiogram.enums import ParseMode
+from aiogram.types import BufferedInputFile, InputMediaPhoto
+
+from krestgg_parser import krest_parser
 
 try:
     from dotenv import load_dotenv
@@ -30,57 +32,42 @@ except ImportError:
 #  КОНФИГ — берём из переменных окружения
 # ─────────────────────────────────────────────
 
-
 def _get_env(name: str, required: bool = True, default: str | None = None) -> str | None:
     val = os.environ.get(name, default)
     if required and not val:
         raise RuntimeError(f"Не задана обязательная переменная окружения: {name}")
     return val
 
-
 DISCORD_TOKEN = _get_env("DISCORD_TOKEN")
 ONLINE_CHANNEL_ID = int(_get_env("ONLINE_CHANNEL_ID"))
 POLL_INTERVAL_SECONDS = int(_get_env("POLL_INTERVAL_SECONDS", required=False, default="120"))
 
-# Основной sqstat
 SQSTAT_BASE_URL = _get_env("SQSTAT_BASE_URL", required=False, default="https://breaking.proxy.sqstat.ru").rstrip("/")
 CLAN_ID = _get_env("CLAN_ID", required=False, default="127")
 
-# Второй sqstat (PSTN)
 PSTN_SQSTAT_BASE_URL = _get_env("PSTN_SQSTAT_BASE_URL", required=False, default="https://pstn.sqstat.ru").rstrip("/")
 PSTN_CLAN_ID = _get_env("PSTN_CLAN_ID", required=False, default="21")
 PSTN_LABEL = _get_env("PSTN_LABEL", required=False, default="PSTN")
 
-# Фильтр по тегу клана в нике игрока
 CLAN_TAG_FILTER = _get_env("CLAN_TAG_FILTER", required=False, default="apes")
 CLAN_TAGS = [t.strip().upper() for t in CLAN_TAG_FILTER.split(",") if t.strip()]
 CLAN_DISPLAY_NAME = _get_env("CLAN_DISPLAY_NAME", required=False, default="Apes")
 
-# Уведомления о конце засида
 _seed_channel = os.environ.get("SEED_ALERT_CHANNEL_ID")
 _seed_role = os.environ.get("SEED_ALERT_ROLE_ID")
 SEED_ALERT_CHANNEL_ID = int(_seed_channel) if _seed_channel else None
 SEED_ALERT_ROLE_ID = int(_seed_role) if _seed_role else None
 SEED_MAP_KEYWORDS = ["seed", "сид"]
 
-# ─────────────────────────────────────────────
-# TELEGRAM И ИНТЕГРАЦИЯ С APOLLO
-# ─────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 _tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_CHAT_ID = int(_tg_chat) if _tg_chat else None
 
-# По умолчанию ID публичного бота Apollo = 475744554910351370
 _apollo_id = os.environ.get("APOLLO_BOT_ID", "475744554910351370")
 APOLLO_BOT_ID = int(_apollo_id) if _apollo_id else None
 
 tg_bot = TGBot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
-
 FLAGS_DIR = "flags"
-
-# ─────────────────────────────────────────────
-#  ЛОГИРОВАНИЕ
-# ─────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,25 +76,131 @@ logging.basicConfig(
 )
 log = logging.getLogger("nw-online-bot")
 
-# ─────────────────────────────────────────────
-#  БОТ DISCORD
-# ─────────────────────────────────────────────
-
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ─────────────────────────────────────────────
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ TELEGRAM
+#  ОЧИСТКА УПОМИНАНИЙ И ОТПРАВКА В TELEGRAM
 # ─────────────────────────────────────────────
 
-async def send_to_telegram(text: str):
-    """Отправляет текстовое сообщение в Telegram-группу с разбивкой по лимиту 4096 символов."""
+def clean_mentions(text: str, guild: discord.Guild | None) -> str:
+    """Заменяет ID ролей, пользователей и каналов их названиями."""
+    if not text:
+        return ""
+
+    if guild:
+        # Замена ролей: <@&123456> -> @RoleName
+        def replace_role(m):
+            role_id = int(m.group(1))
+            role = guild.get_role(role_id)
+            return f"@{role.name}" if role else ""
+
+        # Замена пользователей: <@123456> или <@!123456> -> @UserName
+        def replace_user(m):
+            user_id = int(m.group(1))
+            member = guild.get_member(user_id)
+            return f"@{member.display_name}" if member else ""
+
+        # Замена каналов: <#123456> -> #ChannelName
+        def replace_channel(m):
+            channel_id = int(m.group(1))
+            channel = guild.get_channel(channel_id)
+            return f"#{channel.name}" if channel else ""
+
+        text = re.sub(r"<@&(\d+)>", replace_role, text)
+        text = re.sub(r"<@!?(\d+)>", replace_user, text)
+        text = re.sub(r"<#(\d+)>", replace_channel, text)
+
+    # Запасная очистка любых оставшихся нераспознанных ID тегов
+    text = re.sub(r"<@&?\d+>", "", text)
+    text = re.sub(r"<#\d+>", "", text)
+    return text.strip()
+
+
+async def send_to_telegram(
+    text: str,
+    attachments: list[discord.Attachment] | None = None,
+    image_urls: list[str] | None = None
+):
+    """
+    Отправляет текстовое сообщение и медиафайлы/картинки в Telegram.
+    """
     if not tg_bot or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram не сконфигурирован (нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID)")
+        log.warning("Telegram не сконфигурирован")
         return
 
-    # Разбиваем текст, если он больше 4000 символов
+    attachments = attachments or []
+    image_urls = image_urls or []
+
+    media_files = []
+
+    async with aiohttp.ClientSession() as session:
+        # 1. Загрузка вложений Discord
+        for att in attachments:
+            try:
+                async with session.get(att.url) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        media_files.append((att.filename, data))
+            except Exception as e:
+                log.error(f"Ошибка загрузки вложения {att.url}: {e}")
+
+        # 2. Загрузка картинок по URL (например, из эмбедов)
+        for url in image_urls:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        filename = url.split("/")[-1].split("?")[0] or "image.png"
+                        media_files.append((filename, data))
+            except Exception as e:
+                log.error(f"Ошибка загрузки картинки {url}: {e}")
+
+    # Если есть медиафайлы
+    if media_files:
+        if len(media_files) == 1:
+            fname, data = media_files[0]
+            input_file = BufferedInputFile(data, filename=fname)
+            caption = text[:1024] if text else None
+            try:
+                if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                    await tg_bot.send_photo(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        photo=input_file,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    await tg_bot.send_document(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        document=input_file,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML
+                    )
+                return
+            except Exception as e:
+                log.error(f"Ошибка отправки одиночного файла в Telegram: {e}")
+
+        else:
+            # Альбом (media group)
+            photos = []
+            for idx, (fname, data) in enumerate(media_files[:10]):  # Лимит Telegram = 10 файлов
+                caption = text[:1024] if idx == 0 else None
+                photos.append(
+                    InputMediaPhoto(
+                        media=BufferedInputFile(data, filename=fname),
+                        caption=caption,
+                        parse_mode=ParseMode.HTML if caption else None
+                    )
+                )
+            try:
+                await tg_bot.send_media_group(chat_id=TELEGRAM_CHAT_ID, media=photos)
+                return
+            except Exception as e:
+                log.error(f"Ошибка отправки альбома в Telegram: {e}")
+
+    # Текстовое сообщение (без медиа или при ошибках отправки файлов)
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
     for chunk in chunks:
         try:
@@ -117,7 +210,7 @@ async def send_to_telegram(text: str):
                 parse_mode=ParseMode.HTML
             )
         except Exception as e:
-            log.error(f"Ошибка при отправке в Telegram: {e}")
+            log.error(f"Ошибка при отправке текста в Telegram: {e}")
 
 # ─────────────────────────────────────────────
 #  ГЕНЕРАЦИЯ PNG С ОНЛАЙНОМ
@@ -164,14 +257,12 @@ _symbol_font_cache: dict[int, ImageFont.FreeTypeFont] = {}
 def load_font(size: int):
     if size in _font_cache:
         return _font_cache[size]
-
     font = None
     if os.path.exists(_PREFERRED_FONT):
         try:
             font = ImageFont.truetype(_PREFERRED_FONT, size)
         except Exception as e:
             log.warning(f"Не удалось загрузить {_PREFERRED_FONT}: {e}")
-
     if font is None:
         try:
             for f in os.listdir(_FONT_DIR):
@@ -180,7 +271,6 @@ def load_font(size: int):
                     break
         except Exception:
             pass
-
     if font is None:
         for path in [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -192,11 +282,8 @@ def load_font(size: int):
                     break
                 except Exception:
                     pass
-
     if font is None:
-        log.warning("Кириллический шрифт не найден — текст на русском будет отображаться квадратиками!")
         font = ImageFont.load_default()
-
     _font_cache[size] = font
     return font
 
@@ -302,7 +389,6 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
     fn_small = load_font(11)
     fn_count = load_font(13)
 
-    # ── Шапка ──────────────────────────────────────
     draw.rectangle([0, 0, IMG_W, HEADER_H], fill=C_HEADER_BG)
     draw.rectangle([0, 0, 4, HEADER_H], fill=C_BORDER)
     draw_text_mixed(draw, (PAD, 10), CLAN_DISPLAY_NAME, 18, C_BORDER)
@@ -317,7 +403,6 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
     draw.text((dot_x - 12 - tw, dot_y - 8), count_text, font=fn_count, fill=C_GREEN if total > 0 else C_GREY)
     draw.text((IMG_W - PAD - draw.textlength(now_msk, font=fn_small), 40), now_msk, font=fn_small, fill=C_GREY)
 
-    # ── Карточки серверов ──────────────────────────
     y = HEADER_H + PAD
 
     if not active_servers:
@@ -385,7 +470,6 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
 
             y += card_h + PAD
 
-    # ── Футер ──────────────────────────────────────
     footer_y = img_h - FOOTER_H
     draw.line([0, footer_y, IMG_W, footer_y], fill=(30, 30, 55), width=1)
     draw_text_mixed(draw, (PAD, footer_y + 8), f"{CLAN_DISPLAY_NAME} Tracker", 11, C_GREY)
@@ -575,8 +659,6 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
 
     return result
 
-from krestgg_parser import krest_parser
-
 
 async def fetch_online_data() -> dict | None:
     grouped: dict[str, list] = {
@@ -589,23 +671,16 @@ async def fetch_online_data() -> dict | None:
 
     try:
         async with aiohttp.ClientSession() as session:
-            main_task = _fetch_sqstat_instance(
-                session, SQSTAT_BASE_URL, CLAN_ID
-            )
+            main_task = _fetch_sqstat_instance(session, SQSTAT_BASE_URL, CLAN_ID)
             pstn_task = _fetch_sqstat_instance(
-                session,
-                PSTN_SQSTAT_BASE_URL,
-                PSTN_CLAN_ID,
-                default_srv_prefix=PSTN_LABEL,
+                session, PSTN_SQSTAT_BASE_URL, PSTN_CLAN_ID, default_srv_prefix=PSTN_LABEL
             )
-            # Параллельный запуск BSS, PSTN и KREST.GG
             krest_task = krest_parser.get_pet_online_by_server()
 
             main_res, pstn_res, krest_res = await asyncio.gather(
                 main_task, pstn_task, krest_task, return_exceptions=True
             )
 
-            # Безопасная обработка BSS и PSTN
             if isinstance(main_res, dict):
                 _known_clan_names.update(main_res.get("roster_names", set()))
             if isinstance(pstn_res, dict):
@@ -624,22 +699,13 @@ async def fetch_online_data() -> dict | None:
                 return matched
 
             if isinstance(main_res, dict):
-                for srv_name, players in main_res.get(
-                    "players_by_server", {}
-                ).items():
-                    grouped.setdefault(srv_name, []).extend(
-                        filter_players(players)
-                    )
+                for srv_name, players in main_res.get("players_by_server", {}).items():
+                    grouped.setdefault(srv_name, []).extend(filter_players(players))
 
             if isinstance(pstn_res, dict):
-                for srv_name, players in pstn_res.get(
-                    "players_by_server", {}
-                ).items():
-                    grouped.setdefault(srv_name, []).extend(
-                        filter_players(players)
-                    )
+                for srv_name, players in pstn_res.get("players_by_server", {}).items():
+                    grouped.setdefault(srv_name, []).extend(filter_players(players))
 
-            # Добавление результатов krest.gg
             if isinstance(krest_res, dict):
                 for srv_name, players_nicks in krest_res.items():
                     formatted_krest_players = [
@@ -650,9 +716,7 @@ async def fetch_online_data() -> dict | None:
                         }
                         for nick in players_nicks
                     ]
-                    grouped.setdefault(srv_name, []).extend(
-                        filter_players(formatted_krest_players)
-                    )
+                    grouped.setdefault(srv_name, []).extend(filter_players(formatted_krest_players))
 
     except Exception as e:
         log.error(f"fetch_online_data error: {e}", exc_info=True)
@@ -825,7 +889,6 @@ ALLOWED_USER_ID = 1222498661913854014
 @bot.command(name="tgsend")
 async def cmd_tg_send(ctx: commands.Context, *, text: str):
     """Отправляет произвольное сообщение в подключённый Telegram-чат."""
-    # Проверка прав: пользователь по ID или наличие нужной роли
     has_role = any(role.id == ALLOWED_ROLE_ID for role in getattr(ctx.author, "roles", []))
     is_allowed_user = ctx.author.id == ALLOWED_USER_ID
 
@@ -837,15 +900,14 @@ async def cmd_tg_send(ctx: commands.Context, *, text: str):
         await ctx.send("Интеграция с Telegram не настроена на сервере (проверь .env).")
         return
 
-    formatted_text = f"<b>Сообщение от {ctx.author.display_name}:</b>\n\n{text}"
-    await send_to_telegram(formatted_text)
+    clean_text = clean_mentions(text, ctx.guild)
+    formatted_text = f"<b>Сообщение от {html.escape(ctx.author.display_name)}:</b>\n\n{html.escape(clean_text)}"
+    await send_to_telegram(formatted_text, attachments=ctx.message.attachments)
     await ctx.send("✅ Сообщение успешно переслано в Telegram!")
 
 # ─────────────────────────────────────────────
 #  ОБРАБОТКА СООБЩЕНИЙ (КРОССПОСТИНГ APOLLO)
 # ─────────────────────────────────────────────
-
-
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -855,29 +917,40 @@ async def on_message(message: discord.Message):
     # Перехват сообщений от Apollo Bot
     if APOLLO_BOT_ID and message.author.id == APOLLO_BOT_ID:
         tg_text_parts = ["📢 <b>Объявление о тренировке (Apollo):</b>"]
+        embed_images = []
 
         # 1. Основное содержимое сообщения
         if message.content:
-            # Очищаем упоминания Discord вида <@&12345> или <@12345>
-            clean_content = re.sub(r"<@&?\d+>", "", message.content).strip()
+            clean_content = clean_mentions(message.content, message.guild)
             if clean_content:
                 tg_text_parts.append(f"\n{html.escape(clean_content)}")
 
         # 2. Обработка карточек (Embeds)
         for embed in message.embeds:
             if embed.title:
-                tg_text_parts.append(f"\n<b>{html.escape(embed.title)}</b>")
+                tg_text_parts.append(f"\n<b>{html.escape(clean_mentions(embed.title, message.guild))}</b>")
             if embed.description:
-                clean_desc = re.sub(r"<@&?\d+>", "", embed.description)
+                clean_desc = clean_mentions(embed.description, message.guild)
                 tg_text_parts.append(f"{html.escape(clean_desc)}")
             for field in embed.fields:
-                clean_value = re.sub(r"<@&?\d+>", "", field.value)
+                clean_name = clean_mentions(field.name, message.guild)
+                clean_value = clean_mentions(field.value, message.guild)
                 tg_text_parts.append(
-                    f"\n<b>{html.escape(field.name)}</b>\n{html.escape(clean_value)}"
+                    f"\n<b>{html.escape(clean_name)}</b>\n{html.escape(clean_value)}"
                 )
 
+            # Сохранение картинок из эмбедов (при наличии)
+            if embed.image and embed.image.url:
+                embed_images.append(embed.image.url)
+            elif embed.thumbnail and embed.thumbnail.url:
+                embed_images.append(embed.thumbnail.url)
+
         final_text = "\n".join(tg_text_parts)
-        await send_to_telegram(final_text)
+        await send_to_telegram(
+            text=final_text,
+            attachments=message.attachments,
+            image_urls=embed_images
+        )
         log.info(f"Переслано объявление Apollo в Telegram из канала #{message.channel}")
 
     await bot.process_commands(message)
